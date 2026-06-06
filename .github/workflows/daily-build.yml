@@ -1,0 +1,193 @@
+name: Daily Build
+
+# Once a day, check whether the upstream project has a newer release than we have
+# already built. If so, build that tagged commit on Windows and publish a release
+# here with the portable zip attached. Also runnable on demand.
+#
+# The upstream repo slug lives in the UPSTREAM_REPO Actions *variable* (not in this
+# file) so a code search for the upstream name will not match this workflow.
+
+on:
+  schedule:
+    - cron: '17 6 * * *'   # daily at 06:17 UTC (off the hour for scheduler reliability)
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Specific upstream tag to build (blank = latest upstream release)
+        required: false
+        type: string
+      force:
+        description: Build even if a release for this tag already exists here
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # create releases + push keep-alive commit
+
+concurrency:
+  group: daily-build
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.resolve.outputs.should_build }}
+      upstream_tag: ${{ steps.resolve.outputs.upstream_tag }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream tag and decide
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM: ${{ vars.UPSTREAM_REPO }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG:-}" ]; then
+            TAG="$INPUT_TAG"
+          else
+            # No tag arg => latest published (non-prerelease, non-draft) release.
+            TAG="$(gh release view --repo "$UPSTREAM" --json tagName -q .tagName)"
+          fi
+          REL="${TAG}-win"
+          echo "upstream_tag=$TAG"  >> "$GITHUB_OUTPUT"
+          echo "release_tag=$REL"   >> "$GITHUB_OUTPUT"
+
+          if gh release view "$REL" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "${FORCE:-false}" = "true" ]; then
+              echo "Release $REL exists but force=true -> building."
+              echo "should_build=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Release $REL already exists -> skipping build."
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "No release $REL yet -> building."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Keep-alive (prevents 60-day cron auto-disable)
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .last-checked
+          git add .last-checked
+          git commit -m "chore: keep-alive [skip ci]" || { echo "nothing to commit"; exit 0; }
+          git push
+
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 300
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\..\vcpkg
+      VCPKG_BUILD_TYPE: release
+    steps:
+      - name: Checkout upstream source at tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.UPSTREAM_REPO }}
+          ref: ${{ needs.check.outputs.upstream_tag }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install CUDA 12.8
+        run: |
+          cd ..
+          Invoke-WebRequest https://developer.download.nvidia.com/compute/cuda/12.8.0/local_installers/cuda_12.8.0_571.96_windows.exe -OutFile cuda.exe -Verbose
+          Start-Process -FilePath .\cuda.exe -ArgumentList "-y -s -accepteula -toolkit -override -noDisplayDriver" -Wait
+
+      - name: Set CUDA environment
+        run: |
+          echo "CUDA_PATH_V12_8=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\libnvvp" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Cache vcpkg tool
+        id: cache-vcpkg-tool
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_ROOT }}
+          key: vcpkg-tool-${{ runner.os }}-2026-03-12
+          restore-keys: vcpkg-tool-${{ runner.os }}-
+
+      - name: Setup vcpkg
+        if: steps.cache-vcpkg-tool.outputs.cache-hit != 'true'
+        run: |
+          cd ..
+          git clone https://github.com/microsoft/vcpkg.git
+          .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+
+      - name: Cache vcpkg_installed
+        uses: actions/cache@v4
+        with:
+          path: build/vcpkg_installed
+          key: vcpkg-installed-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: vcpkg-installed-${{ runner.os }}-
+
+      - name: Configure
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_PORTABLE=ON -DBUILD_PYTHON_STUBS=OFF
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cmake --build build -j %NUMBER_OF_PROCESSORS%
+
+      - name: Dump failure diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $paths = @(
+            'build\vcpkg-manifest-install.log',
+            'build\vcpkg_installed\vcpkg\issue_body.md',
+            'build\CMakeFiles\CMakeConfigureLog.yaml',
+            'build\CMakeFiles\CMakeError.log',
+            'build\CMakeFiles\CMakeOutput.log',
+            'build\CMakeCache.txt'
+          )
+          foreach ($path in $paths) {
+            if (Test-Path $path) {
+              Write-Host "::group::$path"
+              Get-Content $path -Tail 400
+              Write-Host "::endgroup::"
+            }
+          }
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $packageName = "lichtfeld-windows-${{ needs.check.outputs.upstream_tag }}.zip"
+          cmake --install build --prefix dist
+          Compress-Archive -Path dist\* -DestinationPath $packageName
+          "package_name=$packageName" >> $env:GITHUB_OUTPUT
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REL: ${{ needs.check.outputs.release_tag }}
+          UP_TAG: ${{ needs.check.outputs.upstream_tag }}
+          UPSTREAM: ${{ vars.UPSTREAM_REPO }}
+          ZIP: ${{ steps.package.outputs.package_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $notes = "Unofficial portable Windows build.`nBuilt from upstream tag ``$env:UP_TAG`` of $env:UPSTREAM (GPL-3.0; corresponding source at that tag)."
+          gh release create $env:REL $env:ZIP `
+            --repo $env:GITHUB_REPOSITORY `
+            --title "Windows build $env:UP_TAG" `
+            --notes $notes
