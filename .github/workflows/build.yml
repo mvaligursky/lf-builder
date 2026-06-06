@@ -1,30 +1,34 @@
 name: Scheduled Build
 
-# Twice a week, check whether the upstream moving "nightly" tag points at a commit
-# we have not built yet. If so, build that exact commit on Windows and publish a
-# release here (named nightly-<date>-<shortsha>) with the portable zip attached.
-# Keeps only the most recent few releases. Also runnable on demand.
+# Runs daily. Decision order:
+#   1. If upstream's latest semver tag (vX.Y.Z) has not been built here -> build it,
+#      publish as <tag>-win.
+#   2. Else if no build happened in the last 7 days -> build upstream's moving
+#      "nightly" snapshot, publish as nightly-<date>-<shortsha>.
+#   3. Otherwise do nothing.
+# A committed state.json tracks what has been built and when, so decisions are
+# independent of release pruning. Also runnable on demand.
 #
 # Upstream slug is in the UPSTREAM_REPO Actions variable so a code search for the
 # upstream name will not match this file.
 
 on:
   schedule:
-    - cron: '17 6 * * 1,4'   # Mon & Thu at 06:17 UTC
+    - cron: '17 6 * * *'   # daily at 06:17 UTC
   workflow_dispatch:
     inputs:
       ref:
-        description: Upstream ref/SHA to build (blank = the 'nightly' tag)
+        description: Upstream ref/SHA to build on demand (blank = use the daily logic)
         required: false
         type: string
       force:
-        description: Build even if this commit was already built
+        description: Force a build of the nightly snapshot even if nothing is due
         required: false
         type: boolean
         default: false
 
 permissions:
-  contents: write   # create/delete releases + push keep-alive commit
+  contents: write   # create/delete releases + push state/keep-alive commits
 
 concurrency:
   group: scheduled-build
@@ -40,11 +44,12 @@ jobs:
       should_build: ${{ steps.resolve.outputs.should_build }}
       sha: ${{ steps.resolve.outputs.sha }}
       release_tag: ${{ steps.resolve.outputs.release_tag }}
+      mode: ${{ steps.resolve.outputs.mode }}
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
 
-      - name: Resolve upstream commit and decide
+      - name: Decide what (if anything) to build
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
@@ -53,29 +58,61 @@ jobs:
           FORCE: ${{ github.event.inputs.force }}
         run: |
           set -euo pipefail
-          REF="${INPUT_REF:-nightly}"
-          # Resolve any ref (tag/branch/sha) to its commit SHA.
-          SHA="$(gh api "repos/$UPSTREAM/commits/$REF" --jq .sha)"
-          SHORT="${SHA:0:7}"
-          DATE="$(date -u +%Y%m%d)"
-          REL="nightly-$DATE-$SHORT"
-          echo "sha=$SHA"            >> "$GITHUB_OUTPUT"
-          echo "release_tag=$REL"    >> "$GITHUB_OUTPUT"
+          if [ -f state.json ]; then STATE="$(cat state.json)"; else STATE='{"built":[],"last_build":null}'; fi
+          is_built()     { echo "$STATE" | jq -e --arg t "$1"  '.built | index($t) != null'   >/dev/null 2>&1; }
+          is_built_sha() { echo "$STATE" | jq -e --arg s "-$1" 'any(.built[]; endswith($s))'   >/dev/null 2>&1; }
 
-          # Already built this commit? (any existing release tag ending in -<short>)
-          EXISTING="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName -q '.[].tagName' || true)"
-          if echo "$EXISTING" | grep -q -- "-$SHORT\$"; then
-            if [ "${FORCE:-false}" = "true" ]; then
-              echo "Commit $SHORT already built but force=true -> building."
-              echo "should_build=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "Commit $SHORT already built -> skipping."
-              echo "should_build=false" >> "$GITHUB_OUTPUT"
-            fi
+          MODE=""; SHA=""; REL=""; BUILD=false
+
+          if [ -n "${INPUT_REF:-}" ]; then
+            MODE=manual
+            SHA="$(gh api "repos/$UPSTREAM/commits/$INPUT_REF" --jq .sha)"
+            SAFE="$(echo "$INPUT_REF" | tr '/' '-')"
+            REL="manual-$SAFE-${SHA:0:7}"
+            BUILD=true
           else
-            echo "Commit $SHORT not built yet -> building."
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            # 1) Newest semver tag upstream (vX, vX.Y, vX.Y.Z), excluding 'nightly'.
+            LATEST_TAG="$(gh api "repos/$UPSTREAM/tags" --paginate --jq '.[].name' \
+                          | grep -E '^v[0-9]+(\.[0-9]+){0,2}$' | sort -V | tail -1 || true)"
+            if [ -n "$LATEST_TAG" ] && ! is_built "${LATEST_TAG}-win"; then
+              MODE=tag
+              SHA="$(gh api "repos/$UPSTREAM/commits/$LATEST_TAG" --jq .sha)"
+              REL="${LATEST_TAG}-win"
+              BUILD=true
+            else
+              # 2) No new tag -> build nightly if it has been >7 days since last build.
+              LAST="$(echo "$STATE" | jq -r '.last_build // empty')"
+              STALE=true
+              if [ -n "$LAST" ]; then
+                LE="$(date -u -d "$LAST" +%s 2>/dev/null || echo 0)"
+                if [ "$LE" -gt 0 ] && [ "$(( $(date -u +%s) - LE ))" -lt "$((7*86400))" ]; then STALE=false; fi
+              fi
+              if [ "$STALE" = true ]; then
+                SHA="$(gh api "repos/$UPSTREAM/commits/nightly" --jq .sha)"
+                if ! is_built_sha "${SHA:0:7}"; then
+                  MODE=periodic
+                  REL="nightly-$(date -u +%Y%m%d)-${SHA:0:7}"
+                  BUILD=true
+                fi
+              fi
+            fi
           fi
+
+          # Manual force: build the nightly snapshot even if nothing was due.
+          if [ "${FORCE:-false}" = "true" ] && [ "$BUILD" != "true" ]; then
+            MODE=forced
+            SHA="$(gh api "repos/$UPSTREAM/commits/nightly" --jq .sha)"
+            REL="nightly-$(date -u +%Y%m%d)-${SHA:0:7}"
+            BUILD=true
+          fi
+
+          echo "Decision: should_build=$BUILD mode=${MODE:-none} tag=${REL:-none} sha=${SHA:0:7}"
+          {
+            echo "should_build=$BUILD"
+            echo "sha=$SHA"
+            echo "release_tag=$REL"
+            echo "mode=$MODE"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Keep-alive (prevents 60-day cron auto-disable)
         run: |
@@ -212,26 +249,55 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REL: ${{ needs.check.outputs.release_tag }}
           SHA: ${{ needs.check.outputs.sha }}
+          MODE: ${{ needs.check.outputs.mode }}
           UPSTREAM: ${{ vars.UPSTREAM_REPO }}
           ZIP: ${{ steps.package.outputs.package_name }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $notes = "Unofficial portable Windows build.`nBuilt from $env:UPSTREAM commit ``$env:SHA`` (GPL-3.0; corresponding source at that commit)."
+          $notes = "Unofficial portable Windows build ($env:MODE).`nBuilt from $env:UPSTREAM commit ``$env:SHA`` (GPL-3.0; corresponding source at that commit)."
           gh release create $env:REL $env:ZIP `
             --repo $env:GITHUB_REPOSITORY `
             --title "Windows build $env:REL" `
             --notes $notes
 
+  record:
+    needs: [check, build]
+    if: ${{ needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Record build in state.json
+        env:
+          REL: ${{ needs.check.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          [ -f state.json ] || echo '{"built":[],"last_build":null}' > state.json
+          TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          tmp="$(mktemp)"
+          jq --arg rel "$REL" --arg ts "$TS" \
+            '.built = ((.built + [$rel]) | unique) | .last_build = $ts' state.json > "$tmp"
+          mv "$tmp" state.json
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git commit -m "chore: record build $REL [skip ci]" || { echo "no change"; exit 0; }
+          git push
+
       - name: Prune old releases (keep most recent KEEP_RELEASES)
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $keep = [int]"${{ env.KEEP_RELEASES }}"
-          $all = gh release list --repo $env:GITHUB_REPOSITORY --limit 100 --json tagName,createdAt | ConvertFrom-Json
-          $stale = $all | Sort-Object { [datetime]$_.createdAt } -Descending | Select-Object -Skip $keep
-          foreach ($r in $stale) {
-            Write-Host "Deleting old release $($r.tagName)"
-            gh release delete $r.tagName --repo $env:GITHUB_REPOSITORY --yes --cleanup-tag
-          }
+          set -euo pipefail
+          KEEP="${KEEP_RELEASES}"
+          mapfile -t TAGS < <(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json tagName,createdAt -q 'sort_by(.createdAt) | reverse | .[].tagName')
+          i=0
+          for t in "${TAGS[@]}"; do
+            i=$((i+1))
+            if [ "$i" -gt "$KEEP" ]; then
+              echo "Deleting old release $t"
+              gh release delete "$t" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+            fi
+          done

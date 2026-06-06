@@ -3,15 +3,29 @@
 Personal automation that produces portable Windows builds and publishes them as
 releases in this repository.
 
-- **Schedule:** runs twice a week (Mon & Thu). Builds only when upstream's moving
-  `nightly` tag points at a commit that hasn't been built yet; otherwise it's a
-  ~30s no-op.
-- **On demand:** Actions tab → *Scheduled Build* → **Run workflow** (optionally
-  enter a specific upstream ref/SHA, or tick *force* to rebuild an existing commit).
-- **Versioning:** releases are named `nightly-<date>-<shortsha>` (no public semver
-  releases exist upstream anymore).
-- **Retention:** only the most recent 3 releases are kept; older ones are pruned
-  automatically (see `KEEP_RELEASES`).
-- **Downloads:** see the [Releases](../../releases) page.
+## Schedule & logic
+
+Runs **daily**. Each run decides, in order:
+
+1. **New tag?** If upstream's latest semver tag (`vX.Y.Z`) hasn't been built yet →
+   build it, publish as `vX.Y.Z-win`.
+2. **Stale?** Otherwise, if no build has happened in the **last 7 days** → build
+   upstream's moving `nightly` snapshot, publish as `nightly-<date>-<shortsha>`.
+3. Otherwise → no-op (a ~30s check).
+
+A committed `state.json` records what has been built and the last-build time, so
+decisions don't depend on which releases are still around.
+
+## Manual runs
+
+Actions tab → *Scheduled Build* → **Run workflow**:
+- `ref` — build a specific upstream tag/branch/SHA on demand.
+- `force` — build the current `nightly` snapshot even if nothing is due.
+
+## Retention & downloads
+
+- Only the most recent **3** releases are kept (`KEEP_RELEASES`); older ones are
+  pruned automatically.
+- Downloads: see the [Releases](../../releases) page.
 
 The upstream project slug is stored in the `UPSTREAM_REPO` Actions variable.
