@@ -1,74 +1,79 @@
-name: Daily Build
+name: Scheduled Build
 
-# Once a day, check whether the upstream project has a newer release than we have
-# already built. If so, build that tagged commit on Windows and publish a release
-# here with the portable zip attached. Also runnable on demand.
+# Twice a week, check whether the upstream moving "nightly" tag points at a commit
+# we have not built yet. If so, build that exact commit on Windows and publish a
+# release here (named nightly-<date>-<shortsha>) with the portable zip attached.
+# Keeps only the most recent few releases. Also runnable on demand.
 #
-# The upstream repo slug lives in the UPSTREAM_REPO Actions *variable* (not in this
-# file) so a code search for the upstream name will not match this workflow.
+# Upstream slug is in the UPSTREAM_REPO Actions variable so a code search for the
+# upstream name will not match this file.
 
 on:
   schedule:
-    - cron: '17 6 * * *'   # daily at 06:17 UTC (off the hour for scheduler reliability)
+    - cron: '17 6 * * 1,4'   # Mon & Thu at 06:17 UTC
   workflow_dispatch:
     inputs:
-      tag:
-        description: Specific upstream tag to build (blank = latest upstream release)
+      ref:
+        description: Upstream ref/SHA to build (blank = the 'nightly' tag)
         required: false
         type: string
       force:
-        description: Build even if a release for this tag already exists here
+        description: Build even if this commit was already built
         required: false
         type: boolean
         default: false
 
 permissions:
-  contents: write   # create releases + push keep-alive commit
+  contents: write   # create/delete releases + push keep-alive commit
 
 concurrency:
-  group: daily-build
+  group: scheduled-build
   cancel-in-progress: false
+
+env:
+  KEEP_RELEASES: '3'   # how many most-recent releases to retain
 
 jobs:
   check:
     runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.resolve.outputs.should_build }}
-      upstream_tag: ${{ steps.resolve.outputs.upstream_tag }}
+      sha: ${{ steps.resolve.outputs.sha }}
       release_tag: ${{ steps.resolve.outputs.release_tag }}
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
 
-      - name: Resolve upstream tag and decide
+      - name: Resolve upstream commit and decide
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
           UPSTREAM: ${{ vars.UPSTREAM_REPO }}
-          INPUT_TAG: ${{ github.event.inputs.tag }}
+          INPUT_REF: ${{ github.event.inputs.ref }}
           FORCE: ${{ github.event.inputs.force }}
         run: |
           set -euo pipefail
-          if [ -n "${INPUT_TAG:-}" ]; then
-            TAG="$INPUT_TAG"
-          else
-            # No tag arg => latest published (non-prerelease, non-draft) release.
-            TAG="$(gh release view --repo "$UPSTREAM" --json tagName -q .tagName)"
-          fi
-          REL="${TAG}-win"
-          echo "upstream_tag=$TAG"  >> "$GITHUB_OUTPUT"
-          echo "release_tag=$REL"   >> "$GITHUB_OUTPUT"
+          REF="${INPUT_REF:-nightly}"
+          # Resolve any ref (tag/branch/sha) to its commit SHA.
+          SHA="$(gh api "repos/$UPSTREAM/commits/$REF" --jq .sha)"
+          SHORT="${SHA:0:7}"
+          DATE="$(date -u +%Y%m%d)"
+          REL="nightly-$DATE-$SHORT"
+          echo "sha=$SHA"            >> "$GITHUB_OUTPUT"
+          echo "release_tag=$REL"    >> "$GITHUB_OUTPUT"
 
-          if gh release view "$REL" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          # Already built this commit? (any existing release tag ending in -<short>)
+          EXISTING="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName -q '.[].tagName' || true)"
+          if echo "$EXISTING" | grep -q -- "-$SHORT\$"; then
             if [ "${FORCE:-false}" = "true" ]; then
-              echo "Release $REL exists but force=true -> building."
+              echo "Commit $SHORT already built but force=true -> building."
               echo "should_build=true" >> "$GITHUB_OUTPUT"
             else
-              echo "Release $REL already exists -> skipping build."
+              echo "Commit $SHORT already built -> skipping."
               echo "should_build=false" >> "$GITHUB_OUTPUT"
             fi
           else
-            echo "No release $REL yet -> building."
+            echo "Commit $SHORT not built yet -> building."
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -91,11 +96,11 @@ jobs:
       VCPKG_ROOT: ${{ github.workspace }}\..\vcpkg
       VCPKG_BUILD_TYPE: release
     steps:
-      - name: Checkout upstream source at tag
+      - name: Checkout upstream source at commit
         uses: actions/checkout@v4
         with:
           repository: ${{ vars.UPSTREAM_REPO }}
-          ref: ${{ needs.check.outputs.upstream_tag }}
+          ref: ${{ needs.check.outputs.sha }}
           fetch-depth: 0
           submodules: recursive
 
@@ -171,7 +176,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $packageName = "lichtfeld-windows-${{ needs.check.outputs.upstream_tag }}.zip"
+          $packageName = "lichtfeld-windows-${{ needs.check.outputs.release_tag }}.zip"
           cmake --install build --prefix dist
           Compress-Archive -Path dist\* -DestinationPath $packageName
           "package_name=$packageName" >> $env:GITHUB_OUTPUT
@@ -181,13 +186,27 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REL: ${{ needs.check.outputs.release_tag }}
-          UP_TAG: ${{ needs.check.outputs.upstream_tag }}
+          SHA: ${{ needs.check.outputs.sha }}
           UPSTREAM: ${{ vars.UPSTREAM_REPO }}
           ZIP: ${{ steps.package.outputs.package_name }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $notes = "Unofficial portable Windows build.`nBuilt from upstream tag ``$env:UP_TAG`` of $env:UPSTREAM (GPL-3.0; corresponding source at that tag)."
+          $notes = "Unofficial portable Windows build.`nBuilt from $env:UPSTREAM commit ``$env:SHA`` (GPL-3.0; corresponding source at that commit)."
           gh release create $env:REL $env:ZIP `
             --repo $env:GITHUB_REPOSITORY `
-            --title "Windows build $env:UP_TAG" `
+            --title "Windows build $env:REL" `
             --notes $notes
+
+      - name: Prune old releases (keep most recent KEEP_RELEASES)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $keep = [int]"${{ env.KEEP_RELEASES }}"
+          $all = gh release list --repo $env:GITHUB_REPOSITORY --limit 100 --json tagName,createdAt | ConvertFrom-Json
+          $stale = $all | Sort-Object { [datetime]$_.createdAt } -Descending | Select-Object -Skip $keep
+          foreach ($r in $stale) {
+            Write-Host "Deleting old release $($r.tagName)"
+            gh release delete $r.tagName --repo $env:GITHUB_REPOSITORY --yes --cleanup-tag
+          }
