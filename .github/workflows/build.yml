@@ -115,14 +115,21 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Keep-alive (prevents 60-day cron auto-disable)
+        if: steps.resolve.outputs.should_build != 'true'   # build days are recorded by the record job
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          date -u +"%Y-%m-%dT%H:%M:%SZ" > .last-checked
-          git add .last-checked
-          git commit -m "chore: keep-alive [skip ci]" || { echo "nothing to commit"; exit 0; }
-          git push
+          # Push can race with other runs; always rebase onto latest main and retry.
+          for attempt in 1 2 3 4 5; do
+            git fetch -q origin main && git reset -q --hard origin/main
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > .last-checked
+            git add .last-checked
+            git commit -q -m "chore: keep-alive [skip ci]" || { echo "nothing to commit"; exit 0; }
+            if git push -q origin HEAD:main; then echo "pushed"; exit 0; fi
+            echo "push rejected, retrying ($attempt)"; sleep $((attempt * 3))
+          done
+          echo "keep-alive push failed after retries"; exit 1
 
   build:
     needs: check
@@ -267,23 +274,32 @@ jobs:
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Record build in state.json
         env:
           REL: ${{ needs.check.outputs.release_tag }}
         run: |
           set -euo pipefail
-          [ -f state.json ] || echo '{"built":[],"last_build":null}' > state.json
-          TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          tmp="$(mktemp)"
-          jq --arg rel "$REL" --arg ts "$TS" \
-            '.built = ((.built + [$rel]) | unique) | .last_build = $ts' state.json > "$tmp"
-          mv "$tmp" state.json
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state.json
-          git commit -m "chore: record build $REL [skip ci]" || { echo "no change"; exit 0; }
-          git push
+          # Re-apply onto the latest main each attempt so a concurrent push can't
+          # leave us on a stale base (the bug that previously dropped state.json).
+          for attempt in 1 2 3 4 5; do
+            git fetch -q origin main && git reset -q --hard origin/main
+            [ -f state.json ] || echo '{"built":[],"last_build":null}' > state.json
+            TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            tmp="$(mktemp)"
+            jq --arg rel "$REL" --arg ts "$TS" \
+              '.built = ((.built + [$rel]) | unique) | .last_build = $ts' state.json > "$tmp"
+            mv "$tmp" state.json
+            git add state.json
+            git commit -q -m "chore: record build $REL [skip ci]" || { echo "no change to record"; exit 0; }
+            if git push -q origin HEAD:main; then echo "recorded $REL"; exit 0; fi
+            echo "push rejected, retrying ($attempt)"; sleep $((attempt * 3))
+          done
+          echo "failed to record state after retries"; exit 1
 
       - name: Prune old releases (keep most recent KEEP_RELEASES)
         env:
