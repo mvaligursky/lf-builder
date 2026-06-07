@@ -35,7 +35,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  KEEP_RELEASES: '3'   # how many most-recent releases to retain
+  KEEP_NIGHTLIES: '3'   # nightly-* builds to retain; tagged (v*-win) releases are kept forever
 
 jobs:
   check:
@@ -301,19 +301,21 @@ jobs:
           done
           echo "failed to record state after retries"; exit 1
 
-      - name: Prune old releases (keep most recent KEEP_RELEASES)
+      - name: Prune old nightly releases (tagged releases are kept forever)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          KEEP="${KEEP_RELEASES}"
-          mapfile -t TAGS < <(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
-            --json tagName,createdAt -q 'sort_by(.createdAt) | reverse | .[].tagName')
+          KEEP="${KEEP_NIGHTLIES}"
+          # Only consider nightly-* releases; v*-win and manual-* are never pruned.
+          mapfile -t TAGS < <(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 \
+            --json tagName,createdAt \
+            -q 'sort_by(.createdAt) | reverse | .[] | select(.tagName | startswith("nightly-")) | .tagName')
           i=0
           for t in "${TAGS[@]}"; do
             i=$((i+1))
             if [ "$i" -gt "$KEEP" ]; then
-              echo "Deleting old release $t"
+              echo "Deleting old nightly release $t"
               gh release delete "$t" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
             fi
           done

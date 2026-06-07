@@ -24,8 +24,8 @@ Actions tab → *Scheduled Build* → **Run workflow**:
 
 ## Retention & downloads
 
-- Only the most recent **3** releases are kept (`KEEP_RELEASES`); older ones are
-  pruned automatically.
+- Tagged releases (`vX.Y.Z-win`) and manual builds are **kept forever**. Only
+  `nightly-*` builds are pruned, retaining the most recent **3** (`KEEP_NIGHTLIES`).
 - Downloads: see the [Releases](../../releases) page.
 
 The upstream project slug is stored in the `UPSTREAM_REPO` Actions variable.
