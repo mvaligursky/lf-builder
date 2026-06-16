@@ -3,8 +3,8 @@ name: Scheduled Build
 # Runs daily. Decision order:
 #   1. If upstream's latest semver tag (vX.Y.Z) has not been built here -> build it,
 #      publish as <tag>-win.
-#   2. Else if no build happened in the last 7 days -> build upstream's moving
-#      "nightly" snapshot, publish as nightly-<date>-<shortsha>.
+#   2. Else if no build happened in the last 7 days -> build the tip of upstream's
+#      master branch, publish as dev-<date>-<shortsha>.
 #   3. Otherwise do nothing.
 # A committed state.json tracks what has been built and when, so decisions are
 # independent of release pruning. Also runnable on demand.
@@ -22,7 +22,7 @@ on:
         required: false
         type: string
       force:
-        description: Force a build of the nightly snapshot even if nothing is due
+        description: Force a build of the current master tip even if nothing is due
         required: false
         type: boolean
         default: false
@@ -35,7 +35,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  KEEP_NIGHTLIES: '3'   # nightly-* builds to retain; tagged (v*-win) releases are kept forever
+  KEEP_DEV_BUILDS: '3'   # dev-* builds to retain; tagged (v*-win) releases are kept forever
 
 jobs:
   check:
@@ -80,7 +80,7 @@ jobs:
               REL="${LATEST_TAG}-win"
               BUILD=true
             else
-              # 2) No new tag -> build nightly if it has been >7 days since last build.
+              # 2) No new tag -> build master tip if it's been >7 days since last build.
               LAST="$(echo "$STATE" | jq -r '.last_build // empty')"
               STALE=true
               if [ -n "$LAST" ]; then
@@ -88,21 +88,21 @@ jobs:
                 if [ "$LE" -gt 0 ] && [ "$(( $(date -u +%s) - LE ))" -lt "$((7*86400))" ]; then STALE=false; fi
               fi
               if [ "$STALE" = true ]; then
-                SHA="$(gh api "repos/$UPSTREAM/commits/nightly" --jq .sha)"
+                SHA="$(gh api "repos/$UPSTREAM/commits/master" --jq .sha)"
                 if ! is_built_sha "${SHA:0:7}"; then
                   MODE=periodic
-                  REL="nightly-$(date -u +%Y%m%d)-${SHA:0:7}"
+                  REL="dev-$(date -u +%Y%m%d)-${SHA:0:7}"
                   BUILD=true
                 fi
               fi
             fi
           fi
 
-          # Manual force: build the nightly snapshot even if nothing was due.
+          # Manual force: build the current master tip even if nothing was due.
           if [ "${FORCE:-false}" = "true" ] && [ "$BUILD" != "true" ]; then
             MODE=forced
-            SHA="$(gh api "repos/$UPSTREAM/commits/nightly" --jq .sha)"
-            REL="nightly-$(date -u +%Y%m%d)-${SHA:0:7}"
+            SHA="$(gh api "repos/$UPSTREAM/commits/master" --jq .sha)"
+            REL="dev-$(date -u +%Y%m%d)-${SHA:0:7}"
             BUILD=true
           fi
 
@@ -301,21 +301,21 @@ jobs:
           done
           echo "failed to record state after retries"; exit 1
 
-      - name: Prune old nightly releases (tagged releases are kept forever)
+      - name: Prune old dev releases (tagged releases are kept forever)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          KEEP="${KEEP_NIGHTLIES}"
-          # Only consider nightly-* releases; v*-win and manual-* are never pruned.
+          KEEP="${KEEP_DEV_BUILDS}"
+          # Only consider dev-* releases; v*-win and manual-* are never pruned.
           mapfile -t TAGS < <(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 \
             --json tagName,createdAt \
-            -q 'sort_by(.createdAt) | reverse | .[] | select(.tagName | startswith("nightly-")) | .tagName')
+            -q 'sort_by(.createdAt) | reverse | .[] | select(.tagName | startswith("dev-")) | .tagName')
           i=0
           for t in "${TAGS[@]}"; do
             i=$((i+1))
             if [ "$i" -gt "$KEEP" ]; then
-              echo "Deleting old nightly release $t"
+              echo "Deleting old dev release $t"
               gh release delete "$t" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
             fi
           done
